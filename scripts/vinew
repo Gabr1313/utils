@@ -1,0 +1,2 @@
+#!/usr/bin/env bash
+new-bin $1 $2 && nvim src/bin/$1.rs

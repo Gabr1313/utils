@@ -1,0 +1,13 @@
+# this function uses 4 arguments:
+#     $1 destination file
+#     $2 source file
+#     $3 first page of the range to extract
+#     $4 last page of the range to extract
+#     output file will be named "inputfile_pXX-pYY.pdf"
+#!/usr/bin/env bash
+gs -q -sDEVICE=pdfwrite -dNOPAUSE -dBATCH -dSAFER \
+   -dFirstPage=${3} \
+   -dLastPage=${4} \
+   -sOutputFile=${1} \
+   ${2}
+

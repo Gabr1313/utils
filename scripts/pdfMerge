@@ -1,0 +1,7 @@
+# this function uses 3 arguments:
+#     $1 destination file 
+#     $2 first file to merge 
+#     $3 second file to merge
+#!/usr/bin/env bash
+gs -q -sDEVICE=pdfwrite -dNOPAUSE -dBATCH -dSAFER \
+  -sOutputFile=${1} ${2} ${3}
