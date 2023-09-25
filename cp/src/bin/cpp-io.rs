@@ -32,6 +32,10 @@ fn main() -> Result<()> {
             create_empty_folder(&current_dir)?;
         }
         run_test_cases(inputs, &flags)?;
+        fs::remove_file(match OS {
+            Os::Windows => ".\\a.exe",
+            Os::Unix => "./a.out",
+        })?;
     }
     Ok(())
 }
