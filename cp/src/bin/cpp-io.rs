@@ -1,5 +1,5 @@
 use cp::threadpool::ThreadPool;
-use std::{env, error::Error, fs, io::Write, path::PathBuf, process, str};
+use std::{env, error::Error, fs, io::Write, path::PathBuf, process, str, sync::Arc};
 
 pub type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
@@ -7,10 +7,10 @@ static OUTPUT_DIR: &str = "output";
 static INPUT_TAG: &str = "input";
 static COL: usize = 80;
 
-static OS: Os = if cfg!(windows) {
-    Os::Windows
-} else if cfg!(unix) {
+static OS: Os = if cfg!(unix) {
     Os::Unix
+} else if cfg!(windows) {
+    Os::Windows
 } else {
     panic!("Unsupported OS");
 };
@@ -22,36 +22,44 @@ enum Os {
 }
 
 fn main() -> Result<()> {
-    let (file_name, flags) = process_args();
+    let (file_name, flags, n_threads) = process_args();
     let current_dir = env::current_dir().expect("Can't get current directory");
     let inputs = get_input_files(&current_dir)?;
-    let build_arg = cmd_args(&file_name, flags[0], flags[3]);
+    let build_arg = cmd_args(&file_name, flags[0], flags[2]);
     let build_status = process::Command::new("g++").args(build_arg).status()?;
     if build_status.success() {
         if flags[1] {
             create_empty_folder(&current_dir)?;
         }
-        run_test_cases(inputs, &flags)?;
-        fs::remove_file(match OS {
+        let binary = match OS {
             Os::Windows => ".\\a.exe",
             Os::Unix => "./a.out",
-        })?;
+        };
+        run_test_cases(binary, inputs, flags[1], n_threads)?;
+        fs::remove_file(binary)?;
     }
     Ok(())
 }
 
-fn process_args() -> (String, Vec<bool>) {
+fn process_args() -> (String, Vec<bool>, usize) {
     let mut file_name = String::new();
-    let mut flags = vec![false; 4];
+    let mut flags = vec![false; 3];
+    let mut n_threads = 1;
     for arg in env::args().into_iter().skip(1) {
-        let mut iter = arg.chars().peekable();
-        if iter.next() == Some('-') {
-            if iter.peek() == Some(&'-') {
+        let bytes = arg.as_bytes();
+        if bytes[0] == b'-' {
+            if bytes[1] == b'-' {
                 match arg.as_str() {
                     "--release" => flags[0] = true,
                     "--output-file" => flags[1] = true,
-                    "--parallel" => flags[2] = true,
-                    "--warning" => flags[3] = true,
+                    "--parallel" => {
+                        let start = "--parallel".len();
+                        let end = change_n_threads(&mut n_threads, bytes, start);
+                        if end < arg.len() {
+                            panic!("Invalid arguments {arg}. Try to use -h flag");
+                        }
+                    }
+                    "--warning" => flags[2] = true,
                     "--help" => {
                         print_help();
                         std::process::exit(0);
@@ -59,18 +67,22 @@ fn process_args() -> (String, Vec<bool>) {
                     _ => panic!("Invalid arguments {arg}. Try to use -h flag"),
                 }
             } else {
-                for c in iter {
-                    match c {
-                        'r' => flags[0] = true,
-                        'o' => flags[1] = true,
-                        'p' => flags[2] = true,
-                        'w' => flags[3] = true,
-                        'h' => {
+                let mut i = 1;
+                while i < bytes.len() {
+                    match bytes[i] {
+                        b'r' => flags[0] = true,
+                        b'o' => flags[1] = true,
+                        b'p' => {
+                            i = change_n_threads(&mut n_threads, bytes, i + 1) - 1;
+                        }
+                        b'w' => flags[2] = true,
+                        b'h' => {
                             print_help();
                             std::process::exit(0);
                         }
                         _ => panic!("Invalid arguments {arg}. Try to use -h flag"),
                     }
+                    i += 1;
                 }
             }
         } else {
@@ -83,18 +95,36 @@ fn process_args() -> (String, Vec<bool>) {
     if file_name.is_empty() {
         panic!("No input file specified. Try to use -h flag");
     }
-    (file_name, flags)
+    (file_name, flags, n_threads)
+}
+
+fn change_n_threads(n_threads: &mut usize, bytes: &[u8], start: usize) -> usize {
+    let mut j = start;
+    while j < bytes.len() && bytes[j] >= b'0' && bytes[j] <= b'9' {
+        j += 1;
+    }
+    *n_threads = std::thread::available_parallelism().unwrap().get();
+    if j > start {
+        *n_threads = str::from_utf8(&bytes[start..j])
+            .unwrap()
+            .parse::<usize>()
+            .unwrap()
+            .min(*n_threads);
+    }
+    j
 }
 
 fn print_help() {
     println!("Usage: cpp-bin [file_name] [option]");
     println!();
     println!("Options:");
-    println!("  -r, --release    \t\tBuild using -Ofast");
-    println!("  -o, --output-file\t\tCreate output folder");
-    println!("  -p, --parallel   \t\tRun test cases in parallel using all available cores");
-    println!("  -w, --warning    \t\tShow warning messages");
-    println!("  -h, --help       \t\tPrint this help message");
+    println!("  -r    --release      Build using -Ofast");
+    println!("  -o    --output-file  Create output folder");
+    println!("  -p[n] --parallel[n]  Run test cases in parallel");
+    println!("                       If specified it spawns `n` threads, otherwise it spawns all aviable ones");
+    println!("  -w    --warning      Show warning messages");
+    println!("  -h    --help         Print this help message");
+    println!("Note: you can also aggregate options like `-rp4o`");
     println!();
     println!("The name of the input files should contain `{INPUT_TAG}`.");
     println!(
@@ -163,41 +193,45 @@ fn create_empty_folder(current_dir: &PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn run_test_cases(inputs: Vec<PathBuf>, flag: &[bool]) -> Result<()> {
-    if flag[2] {
-        let pool = ThreadPool::default();
-        if flag[1] {
+fn run_test_cases(
+    binary: &str,
+    inputs: Vec<PathBuf>,
+    output_file: bool,
+    n_threads: usize,
+) -> Result<()> {
+    if n_threads > 1 {
+        let binary: Arc<str> = binary.into();
+        let pool = ThreadPool::new(n_threads);
+        if output_file {
             for (i, input_file) in inputs.into_iter().enumerate() {
+                let binary = Arc::clone(&binary);
                 pool.execute(move || {
-                    run(&input_file, Some(i)).unwrap();
+                    run(binary.as_ref(), &input_file, Some(i)).unwrap();
                 });
             }
         } else {
             for input_file in inputs.into_iter() {
+                let binary = Arc::clone(&binary);
                 pool.execute(move || {
-                    run(&input_file, None).unwrap();
+                    run(binary.as_ref(), &input_file, None).unwrap();
                 });
             }
         }
     } else {
-        if flag[1] {
+        if output_file {
             for (i, input_file) in inputs.into_iter().enumerate() {
-                run(&input_file, Some(i)).unwrap();
+                run(binary, &input_file, Some(i)).unwrap();
             }
         } else {
             for input_file in inputs.into_iter() {
-                run(&input_file, None).unwrap();
+                run(binary, &input_file, None).unwrap();
             }
         }
     }
     Ok(())
 }
 
-fn run(input_file: &PathBuf, file_number: Option<usize>) -> Result<()> {
-    let binary = match OS {
-        Os::Windows => ".\\a.exe",
-        Os::Unix => "./a.out",
-    };
+fn run(binary: &str, input_file: &PathBuf, file_number: Option<usize>) -> Result<()> {
     let mut process = process::Command::new(binary)
         .stdin(process::Stdio::piped())
         .stdout(process::Stdio::piped())
@@ -214,7 +248,7 @@ fn run(input_file: &PathBuf, file_number: Option<usize>) -> Result<()> {
     if let Some(i) = file_number {
         print_cool(
             &format!(
-                "{}: {}ms | output.{}.txt",
+                "{}: {}ms (output.{}.txt)",
                 match OS {
                     Os::Windows => input_file.to_str().unwrap().split('\\').last().unwrap(),
                     Os::Unix => input_file.to_str().unwrap().split('/').last().unwrap(),
