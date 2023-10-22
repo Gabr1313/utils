@@ -7,3 +7,4 @@ edition = "2021"
 
 [dependencies]
 template_cp = "0.1"
+term_size = "0.3"

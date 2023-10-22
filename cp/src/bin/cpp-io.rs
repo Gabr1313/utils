@@ -5,21 +5,6 @@ pub type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
 static OUTPUT_DIR: &str = "output";
 static INPUT_TAG: &str = "input";
-static COL: usize = 80;
-
-static OS: Os = if cfg!(unix) {
-    Os::Unix
-} else if cfg!(windows) {
-    Os::Windows
-} else {
-    panic!("Unsupported OS");
-};
-
-#[derive(Copy, Clone)]
-enum Os {
-    Windows,
-    Unix,
-}
 
 fn main() -> Result<()> {
     let (file_name, flags, n_threads) = process_args();
@@ -31,10 +16,7 @@ fn main() -> Result<()> {
         if flags[1] {
             create_empty_folder(&current_dir)?;
         }
-        let binary = match OS {
-            Os::Windows => ".\\a.exe",
-            Os::Unix => "./a.out",
-        };
+        let binary = "./a.out";
         run_test_cases(binary, inputs, flags[1], n_threads)?;
         fs::remove_file(binary)?;
     }
@@ -148,11 +130,8 @@ fn get_input_files(dir: &PathBuf) -> Result<Vec<PathBuf>> {
             }
         } else if entry.is_file() {
             let file = entry;
-            let name = match OS {
-                Os::Windows => file.to_str().unwrap().split('\\').last().unwrap(),
-                Os::Unix => file.to_str().unwrap().split('/').last().unwrap(),
-            };
-            if name.contains(INPUT_TAG) {
+            let filename = file.to_str().unwrap().split('/').last().unwrap();
+            if filename.contains(INPUT_TAG) {
                 inputs.push(file);
             }
         }
@@ -165,10 +144,26 @@ fn cmd_args<'a>(file_name: &'a str, release: bool, warning: bool) -> Vec<&'a str
     let mut args = if release {
         vec!["-Ofast", file_name]
     } else {
-        vec!["-O0", "-fsanitize=address", file_name]
+        vec![
+            "-O0",
+            "-fsanitize=address,undefined",
+            "-DDEBUG",
+            "-g",
+            file_name,
+        ]
     };
     if warning {
-        args.append(&mut ["-Wall", "-Wextra"].to_vec());
+        args.append(
+            &mut [
+                "-Wall",
+                "-Wextra",
+                "-Wno-sign-conversion",
+                "-Wshadow",
+                "-D_GLIBCXX_ASSERTIONS",
+                "-fmax-errors=2",
+            ]
+            .to_vec(),
+        );
     }
     args
 }
@@ -176,11 +171,8 @@ fn cmd_args<'a>(file_name: &'a str, release: bool, warning: bool) -> Vec<&'a str
 fn create_empty_folder(current_dir: &PathBuf) -> Result<()> {
     for entry in current_dir.read_dir()? {
         let entry = entry.unwrap().path();
-        let name = match OS {
-            Os::Windows => entry.to_str().unwrap().split('\\').last().unwrap(),
-            Os::Unix => entry.to_str().unwrap().split('/').last().unwrap(),
-        };
-        if name == OUTPUT_DIR {
+        let filename = entry.to_str().unwrap().split('/').last().unwrap();
+        if filename == OUTPUT_DIR {
             if entry.is_dir() {
                 fs::remove_dir_all(entry)?;
             } else if entry.is_file() {
@@ -220,11 +212,11 @@ fn run_test_cases(
     } else {
         if output_file {
             for (i, input_file) in inputs.into_iter().enumerate() {
-                run(binary, &input_file, Some(i)).unwrap();
+                run(binary, &input_file, Some(i))?;
             }
         } else {
             for input_file in inputs.into_iter() {
-                run(binary, &input_file, None).unwrap();
+                run(binary, &input_file, None)?;
             }
         }
     }
@@ -232,13 +224,21 @@ fn run_test_cases(
 }
 
 fn run(binary: &str, input_file: &PathBuf, file_number: Option<usize>) -> Result<()> {
+    let file_name = input_file.to_str().unwrap().split('/').last().unwrap();
     let mut process = process::Command::new(binary)
         .stdin(process::Stdio::piped())
         .stdout(process::Stdio::piped())
         .stderr(process::Stdio::piped())
         .spawn()?;
     if let Some(mut stdin) = process.stdin.take() {
-        stdin.write_all(&fs::read(&input_file)?)?;
+        match stdin.write_all(&fs::read(&input_file)?) {
+            Ok(_) => {}
+            Err(e) => {
+                let mut stdout = std::io::stdout().lock();
+                print_cool(&format!("{}: ERROR: {e}", file_name), &mut stdout)?;
+                return Ok(());
+            }
+        };
     }
     let start = std::time::Instant::now();
     let output = process.wait_with_output()?;
@@ -249,37 +249,18 @@ fn run(binary: &str, input_file: &PathBuf, file_number: Option<usize>) -> Result
         print_cool(
             &format!(
                 "{}: {}ms (output.{}.txt)",
-                match OS {
-                    Os::Windows => input_file.to_str().unwrap().split('\\').last().unwrap(),
-                    Os::Unix => input_file.to_str().unwrap().split('/').last().unwrap(),
-                },
+                file_name,
                 (end - start).as_millis(),
                 i
             ),
             &mut stdout,
         )?;
-        fs::write(
-            format!(
-                "{}{}output.{}.txt",
-                OUTPUT_DIR,
-                match OS {
-                    Os::Windows => "\\",
-                    Os::Unix => "/",
-                },
-                i
-            ),
-            unsafe { String::from_utf8_unchecked(output.stdout) },
-        )?;
+        fs::write(format!("{}{}output.{}.txt", OUTPUT_DIR, '/', i), unsafe {
+            String::from_utf8_unchecked(output.stdout)
+        })?;
     } else {
         print_cool(
-            &format!(
-                "{}: {}ms",
-                match OS {
-                    Os::Windows => input_file.to_str().unwrap().split('\\').last().unwrap(),
-                    Os::Unix => input_file.to_str().unwrap().split('/').last().unwrap(),
-                },
-                (end - start).as_millis()
-            ),
+            &format!("{}: {}ms", file_name, (end - start).as_millis()),
             &mut stdout,
         )?;
         stdout.write_fmt(format_args!("{}", unsafe {
@@ -296,14 +277,15 @@ fn run(binary: &str, input_file: &PathBuf, file_number: Option<usize>) -> Result
 }
 
 fn print_cool<W: Write>(mid: &str, stdout: &mut W) -> Result<()> {
+    let col = if let Some((w, _)) = term_size::dimensions() { w } else { 100 };
     let occupied = 4 + mid.len();
-    let n1 = if occupied >= COL {
+    let n1 = if occupied >= col {
         0
     } else {
-        (COL - occupied) / 2
+        (col - occupied) / 2
     };
     let occupied = 4 + mid.len() + n1;
-    let n2 = if occupied >= COL { 0 } else { COL - occupied };
+    let n2 = if occupied >= col { 0 } else { col - occupied };
     stdout.write_fmt(format_args!(
         "{}> {} <{}\n",
         "-".repeat(n1),
